@@ -7,13 +7,29 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from positional_encodings.torch_encodings import PositionalEncoding2D
+from contextlib import nullcontext
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers import ModelMixin
 from diffusers.utils import BaseOutput
-from diffusers.utils.import_utils import is_xformers_available
-from diffusers.models.attention import CrossAttention, FeedForward, AdaLayerNorm
+# Updated for diffusers 0.35.2: CrossAttention renamed to Attention
+from diffusers.models.attention_processor import Attention
+from diffusers.models.attention import FeedForward, AdaLayerNorm
+CrossAttention = Attention  # Backward compatibility alias
 from einops import rearrange, repeat
+
+# Check xformers availability with fallback
+try:
+    import xformers
+    import xformers.ops
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
+
+
+def is_xformers_available():
+     """Helper function to check xformers availability"""
+     return XFORMERS_AVAILABLE
 
 
 @dataclass
@@ -333,34 +349,48 @@ class FullyFrameAttention(nn.Module):
         self._slice_size = slice_size
     
     def _attention(self, query, key, value, attention_mask=None):
+        """Memory-friendly attention using PyTorch scaled_dot_product_attention to avoid giant score tensors.
+
+        Expects query/key/value of shape (B*H, N, D). We reshape to (B,H,N,D) for the fused op.
+        """
+        B_times_H, N, D = query.shape
+        H = self.heads
+        B = B_times_H // H
+        _, M, _ = key.shape
+
         if self.upcast_attention:
-            query = query.float()
-            key = key.float()
+            query = query.float(); key = key.float(); value = value.float()
 
-        attention_scores = torch.baddbmm(
-            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
-            query,
-            key.transpose(-1, -2),
-            beta=0,
-            alpha=self.scale,
-        )
+        query = query.view(B, H, N, D)
+        key = key.view(B, H, M, D)
+        value = value.view(B, H, M, D)
+
+        # Prepare attention mask if provided (expected shape broadcastable to (B,H,N,M))
+        attn_mask = None
         if attention_mask is not None:
-            attention_scores = attention_scores + attention_mask
+            # If user passed (B*H, N, M) reshape; else let PyTorch broadcast
+            if attention_mask.dim() == 3 and attention_mask.shape[0] == B_times_H:
+                attn_mask = attention_mask.view(B, H, N, M)
+            else:
+                attn_mask = attention_mask
 
-        if self.upcast_softmax:
-            attention_scores = attention_scores.float()
+        # Force memory efficient kernel; disable flash on Hopper to avoid invalid argument error
+        try:
+            cm = torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True)
+        except Exception:
+            cm = nullcontext()
+        with cm:
+            out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
 
-        attention_probs = attention_scores.softmax(dim=-1)
+        # Cast back if we upcasted
+        if self.upcast_attention and out.dtype != torch.float16:
+            # preserve original value dtype when possible
+            desired_dtype = value.dtype if value.dtype in (torch.float16, torch.bfloat16) else out.dtype
+            out = out.to(desired_dtype)
 
-        # cast back to the original dtype
-        attention_probs = attention_probs.to(value.dtype)
-
-        # compute attention output
-        hidden_states = torch.bmm(attention_probs, value)
-
-        # reshape hidden_states
-        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
-        return hidden_states
+        out = out.reshape(B_times_H, N, D)
+        out = self.reshape_batch_dim_to_heads(out)
+        return out
 
     def _sliced_attention(self, query, key, value, sequence_length, dim, attention_mask):
         batch_size_attention = query.shape[0]
@@ -406,11 +436,45 @@ class FullyFrameAttention(nn.Module):
         return hidden_states
 
     def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
-        # TODO attention_mask
+        # Fallback to PyTorch scaled_dot_product_attention for RTX 5090 compatibility
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
-        hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=attention_mask)
+        # Use xformers if available; on failure fall back without clobbering global state
+        global XFORMERS_AVAILABLE
+        hidden_states = None
+        if XFORMERS_AVAILABLE:
+            try:
+                hidden_states = xformers.ops.memory_efficient_attention(
+                    query, key, value, attn_bias=attention_mask, scale=self.scale
+                )
+            except Exception as e:
+                # Log once and leave XFORMERS_AVAILABLE True so future attempts can retry (transient errors)
+                print(f"[warn] xformers memory_efficient_attention failed; falling back to scaled_dot_product_attention: {e}")
+                hidden_states = None
+
+        if hidden_states is None:
+            # Fallback to PyTorch's scaled_dot_product_attention
+            B_times_H, N, C = query.shape
+            H = self.heads
+            B = B_times_H // H
+            _, M, _ = key.shape
+
+            query = query.view(B, H, N, C)
+            key = key.view(B, H, M, C)
+            value = value.view(B, H, M, C)
+
+            # Force memory-efficient SDP to avoid flash kernel issues on new GPUs
+            try:
+                cm = torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True)
+            except Exception:
+                cm = nullcontext()
+            with cm:
+                hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                    query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                )
+            hidden_states = hidden_states.view(B_times_H, N, C)
+
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 

@@ -1,3 +1,127 @@
+# TRACE paper Evaluation - ControlVideo
+
+## Purpose of This Fork
+This repository is a fork maintained by the TRACE paper team for experimental comparison in our work:
+**"TRACE - Temporal Rectification of Attention for Cross-object Editing"** (paper forthcoming).
+We use this fork to benchmark ControlVideo against our TRACE model using a unified dataset + scripts.
+
+### Added / Modified In This Fork (RTX 5090 Hopper Compatibility)
+Target stack: **RTX 5090 (Hopper / sm_120) + CUDA 12.8/13.0 + PyTorch 2.8.0**.
+Original upstream was tied to CUDA 11.6 + torch 1.13, which breaks on Hopper. This fork:
+* Upgrades core libs: PyTorch 2.8.0 / torchvision 0.23.0 / torchaudio 2.8.0
+* Aligns high‑level libs: diffusers 0.35.2, transformers 4.57.1, controlnet-aux 0.0.10, xformers 0.0.32.post2
+* Replaces legacy attention (`baddbmm` + softmax) with fused PyTorch `scaled_dot_product_attention` to prevent >100GiB allocations & flash kernel crash
+* Keeps xformers installed but disables its flash attention fast path on Hopper; SDPA memory‑efficient backend is used instead
+* Provides reproducible environment via `environment.yml` (DO NOT use legacy `requirements.txt`)
+* Adds bilingual fix docs: `RTX5090_HOPPER_FIX_zh-TW.md`, `RTX5090_HOPPER_FIX_en.md`
+* Supplies batch script `run.sh` for one‑command generation of all evaluation videos
+
+### Dataset & Assets
+* Evaluation mp4 inputs under `assets/<category>/`
+* Generated outputs under `outputs/<category>/<video_name>/`
+
+### Reproducible Environment (Conda)
+Use the lock‑style `environment.yml` containing the exact working Hopper stack.
+```bash
+git clone git@github.com:rogerfan48/ControlVideo.git
+cd ControlVideo
+conda env create -f environment.yml
+conda activate controlvideo
+
+python - <<'PY'
+import torch, diffusers, transformers, xformers
+print('torch', torch.__version__)
+print('diffusers', diffusers.__version__)
+print('transformers', transformers.__version__)
+print('xformers', getattr(xformers,'__version__','n/a'))
+print('cuda?', torch.cuda.is_available())
+print('gpu:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')
+PY
+```
+Expected: torch 2.8.0 / diffusers 0.35.2 / transformers 4.57.1 / xformers 0.0.32.post2.
+
+### Checkpoint Acquisition
+Download required weights (≈53GB total): Stable Diffusion v1.5 + ControlNet depth/canny/openpose + RIFE optical flow.
+```bash
+mkdir -p checkpoints && cd checkpoints
+
+huggingface-cli download runwayml/stable-diffusion-v1-5 \
+  --local-dir stable-diffusion-v1-5 --local-dir-use-symlinks False
+huggingface-cli download lllyasviel/sd-controlnet-depth \
+  --local-dir sd-controlnet-depth --local-dir-use-symlinks False
+huggingface-cli download lllyasviel/sd-controlnet-canny \
+  --local-dir sd-controlnet-canny --local-dir-use-symlinks False
+huggingface-cli download lllyasviel/sd-controlnet-openpose \
+  --local-dir sd-controlnet-openpose --local-dir-use-symlinks False
+wget https://github.com/megvii-research/ECCV2022-RIFE/releases/download/v1.0/flownet.pkl
+cd ..
+```
+Directory essentials:
+```
+checkpoints/
+  stable-diffusion-v1-5/{unet,vae,text_encoder,tokenizer,scheduler,...}
+  sd-controlnet-depth/diffusion_pytorch_model.safetensors
+  sd-controlnet-canny/diffusion_pytorch_model.safetensors
+  sd-controlnet-openpose/diffusion_pytorch_model.safetensors
+  flownet.pkl
+```
+
+### One-Command Batch Generation
+```bash
+conda activate controlvideo
+./run.sh
+```
+Generates all evaluation outputs into `outputs/`.
+
+### Single Example Run
+```bash
+conda activate controlvideo
+python inference.py \
+  --prompt "A blue bowl and a yellow bowl are moving on the table." \
+  --condition depth_midas \
+  --video_path assets/o2o/3ball.mp4 \
+  --output_path outputs/o2o/3ball \
+  --video_length 15 \
+  --width 512 --height 512 \
+  --version v10 --seed 42
+```
+Result video: `outputs/o2o/3ball/*.mp4`.
+
+### Batch Script (`run.sh`) Overview
+* Categories: o2o / o2p / p2p
+* Common config: width=512 height=512 seed=42 version=v10
+* Per‑video override (e.g. `n_u_c_s` uses 12 frames)
+To add a new video: place mp4 in `assets/<cat>/`, append a block mirroring existing entries.
+
+### Legacy Requirements Warning
+`requirements.txt` belongs to old CUDA 11.6 stack (torch 1.13.1). **Do not use** for Hopper. Prefer `environment.yml`. Minimal custom install set:
+```
+
+### Troubleshooting / Technical Notes
+* Hopper flash attention crash → solved by SDPA fallback (see docs linked below)
+* Memory pressure → solved by removing explicit score tensor allocation; fused kernel scales better
+* To re‑enable xformers on non‑Hopper GPUs you can later add an env toggle (see docs)
+
+Then add: accelerate, einops, omegaconf, opencv-python, imageio, moviepy, decord, pandas, scikit-image, tqdm, ftfy, timm, tensorboard, wandb, addict, easydict.
+
+### Troubleshooting Quick Table
+| Symptom | Fix |
+|---------|-----|
+| `sm_120 not compatible` | Recreate env using environment.yml (old torch used) |
+| Flash attention CUDA invalid argument | Fork disables flash path; ensure you didn't re‑enable it |
+| OOM in attention | Verify SDPA patch (no giant `baddbmm` tensor) |
+| `cached_download` import error | Upgrade diffusers to 0.35.2 |
+| HuggingFace hub version conflict | `pip install 'huggingface-hub<1.0,>=0.34.0'` |
+
+### Optional Next Steps
+* Add env toggle: `CONTROLVIDEO_USE_XFORMERS=1` for non‑Hopper GPUs
+* Migrate to `torch.nn.attention.sdpa_kernel()` (remove deprecation warning)
+* Add lightweight benchmarking script (VRAM + step time)
+
+### Further Reading
+* Detailed fix: `RTX5090_HOPPER_FIX.md`
+
+---
 # ControlVideo
 
 Official pytorch implementation of "ControlVideo: Training-free Controllable Text-to-Video Generation"

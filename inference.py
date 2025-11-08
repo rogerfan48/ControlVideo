@@ -106,7 +106,18 @@ if __name__ == "__main__":
             controlnet=controlnet, interpolater=interpolater, scheduler=scheduler,
         )
     pipe.enable_vae_slicing()
-    pipe.enable_xformers_memory_efficient_attention()
+    # Disable xformers flash kernel on Hopper; rely on PyTorch SDPA fallback already patched in attention modules
+    try:
+        if hasattr(pipe, "unet"):
+            for m in pipe.unet.modules():
+                if hasattr(m, "_use_memory_efficient_attention_xformers"):
+                    m._use_memory_efficient_attention_xformers = False
+        if hasattr(pipe, "controlnet"):
+            for m in pipe.controlnet.modules():
+                if hasattr(m, "_use_memory_efficient_attention_xformers"):
+                    m._use_memory_efficient_attention_xformers = False
+    except Exception:
+        pass
     pipe.to(device)
 
     generator = torch.Generator(device="cuda")

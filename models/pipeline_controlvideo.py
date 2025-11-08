@@ -28,15 +28,16 @@ from diffusers.models import AutoencoderKL
 from .controlnet import ControlNetOutput
 from diffusers import ModelMixin
 from diffusers.schedulers import DDIMScheduler
+# Updated for diffusers 0.35.2
 from diffusers.utils import (
     PIL_INTERPOLATION,
     is_accelerate_available,
     is_accelerate_version,
     logging,
-    randn_tensor,
     BaseOutput
 )
-from diffusers.pipeline_utils import DiffusionPipeline
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers import DiffusionPipeline
 
 from einops import rearrange
 

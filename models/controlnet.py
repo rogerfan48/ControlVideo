@@ -32,8 +32,9 @@ from .controlnet_unet_blocks import (
 )
 from .resnet import InflatedConv3d
 
-from diffusers.models.unet_2d_condition import UNet2DConditionModel
-from diffusers.models.cross_attention import AttnProcessor
+# Updated for diffusers 0.35.2
+from diffusers import UNet2DConditionModel
+from diffusers.models.attention_processor import AttnProcessor
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -264,6 +265,16 @@ class ControlNetModel3D(ModelMixin, ConfigMixin):
             use_linear_projection=use_linear_projection,
             upcast_attention=upcast_attention,
         )
+
+        # Disable xformers fast path on Hopper (RTX 5090) to avoid flash attention kernel crash; rely on SDPA fallback
+        try:
+            from .controlnet_attention import is_xformers_available
+            if is_xformers_available():
+                for module in self.modules():
+                    if hasattr(module, "_use_memory_efficient_attention_xformers"):
+                        module._use_memory_efficient_attention_xformers = False
+        except Exception:
+            pass
 
     @classmethod
     def from_unet(
